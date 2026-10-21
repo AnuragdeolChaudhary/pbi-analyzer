@@ -1,6 +1,6 @@
 # Power BI Model Analyzer (Phase 1)
 
-Upload a `.pbix` / `.pbit` → see tables, columns, relationships, Power Query M, DAX → export to Excel.
+Upload a `.pbix` / `.pbit` → plain-English explanation of every Power Query step, relationships, DAX → Excel export.
 
 ## Run locally
     pip install -r requirements.txt
