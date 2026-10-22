@@ -684,6 +684,281 @@ def _describe(expr, seen):
     return dict(op='Custom expression', cat=C_OTH, desc=f'Custom M expression: {_short(e, 150)}')
 
 
+
+# ======================================================== before / after tracing
+_INV_OP = {'≠': '=', '=': '≠', '>': '≤', '>=': '<', '<': '≥', '<=': '>'}
+_INV_TXT = {'contains': 'does not contain', 'starts with': 'does not start with',
+            'ends with': 'does not end with', 'is one of': 'is not one of'}
+
+
+def _invert(expr):
+    """Plain-English description of which rows a filter REMOVES (simple conditions only)."""
+    t = _pretty(expr, 600)
+    m = _mask(t)
+    if '(' in m:
+        return None
+    has_and, has_or = ' AND ' in m, ' OR ' in m
+    if has_and and has_or:
+        return None
+    sep = ' AND ' if has_and else (' OR ' if has_or else None)
+    parts, last = [], 0
+    if sep:
+        for mt in re.finditer(sep, m):
+            parts.append(t[last:mt.start()]); last = mt.end()
+    parts.append(t[last:])
+    out = []
+    for p in parts:
+        p = p.strip()
+        if p.startswith('NOT '):
+            out.append(p[4:]); continue
+        mm = re.fullmatch(r'(.+?)\s+(contains|starts with|ends with|is one of)\s+(.+)', p)
+        if mm:
+            out.append(f'{mm.group(1)} {_INV_TXT[mm.group(2)]} {mm.group(3)}'); continue
+        mm = re.fullmatch(r'(.+?)\s*(≠|>=|<=|=|>|<)\s*(.+)', p)
+        if mm:
+            out.append(f'{mm.group(1)} {_INV_OP[mm.group(2)]} {mm.group(3)}'); continue
+        return None
+    return (' OR ' if has_and or not sep else ' AND ').join(out)
+
+
+def _new_state():
+    return {'cols': [], 'complete': False, 'types': {}}
+
+
+def _add(st, *names):
+    for n in names:
+        if n not in st['cols']:
+            st['cols'].append(n)
+
+
+def _drop(st, names):
+    ns = set(names)
+    st['cols'] = [c for c in st['cols'] if c not in ns]
+    for n in names:
+        st['types'].pop(n, None)
+
+
+def _reset(st):
+    st['cols'], st['complete'], st['types'] = [], False, {}
+
+
+def _effect(d, fn, a, st):
+    """Update column-state `st` for this step and describe the table BEFORE and AFTER it."""
+    op = d['op']
+    out = dict(before='', after='', rows='No change', delta=0)
+    cb = len(st['cols']) if st['complete'] else None
+
+    if op in ('Connect to source', 'Custom SQL query'):
+        out.update(before='—', rows='—', delta=None,
+                   after='Connection to the source is opened.' +
+                         (' The SELECT list of the SQL query defines the table columns.' if op == 'Custom SQL query' else ''))
+        return out
+    if op == 'Navigate to object':
+        out.update(before='Source container (list of tables / sheets / files).',
+                   after=f"{d.get('nav', 'The object')} is loaded with all of its columns and rows.",
+                   rows='All rows of the selected object', delta=None)
+        return out
+
+    if fn == 'Table.PromoteHeaders':
+        _reset(st)
+        out.update(before='Column names are generic (Column1, Column2 …); the real names sit in the first data row.',
+                   after='First row becomes the column names and is removed from the data.', rows='1 row fewer (the header row)', delta=None)
+    elif fn == 'Table.DemoteHeaders':
+        _reset(st)
+        out.update(before='Column names are the real headers.', after='Headers become the first data row; columns are renamed Column1, Column2 …',
+                   rows='1 row more', delta=None)
+    elif fn == 'Table.TransformColumnTypes':
+        b, af = [], []
+        for it in _items(g(a, 1)):
+            p = _split(_inner(it))
+            if len(p) >= 2:
+                c, t = _unq(p[0]), _type_label(p[1])
+                b.append(f"{c}: {st['types'].get(c, st.get('default', 'as delivered by the source'))}")
+                af.append(f'{c}: {t}')
+                _add(st, c); st['types'][c] = t
+        out.update(before=_fmt(b, 10), after=_fmt(af, 10), rows='No change in rows or columns (only data types change)')
+    elif fn == 'Table.RenameColumns':
+        pairs = []
+        for it in _items(g(a, 1)):
+            p = _split(_inner(it))
+            if len(p) >= 2:
+                pairs.append((_unq(p[0]), _unq(p[1])))
+        for o, n in pairs:
+            if o in st['cols']:
+                st['cols'][st['cols'].index(o)] = n
+            else:
+                _add(st, n)
+            if o in st['types']:
+                st['types'][n] = st['types'].pop(o)
+        out.update(before=_fmt([o for o, _ in pairs], 10), after=_fmt([n for _, n in pairs], 10),
+                   rows='No change in rows or columns (names only)')
+    elif fn == 'Table.RemoveColumns':
+        cols = _cols(g(a, 1))
+        for c in cols:
+            if not st['complete']:
+                _add(st, c)
+        out.update(before=f'Table contains: {_fmt(cols, 10)} (and others)', delta=-len(cols))
+        _drop(st, cols)
+        out.update(after=f'{len(cols)} column(s) gone: {_fmt(cols, 10)}', rows='No change in rows')
+    elif fn == 'Table.SelectColumns':
+        cols = _cols(g(a, 1))
+        out.update(before='All columns of the previous step' + (f' ({cb})' if cb is not None else ''),
+                   delta=(len(cols) - cb) if cb is not None else None)
+        st['cols'], st['complete'] = list(cols), True
+        st['types'] = {k: v for k, v in st['types'].items() if k in cols}
+        out.update(after=f'Exactly {len(cols)} column(s): {_fmt(cols, 12)}', rows='No change in rows')
+    elif fn == 'Table.ReorderColumns':
+        order = _cols(g(a, 1))
+        st['cols'] = order + [c for c in st['cols'] if c not in order]
+        out.update(before='Previous column order', after=f'Column order starts with: {_fmt(order, 8)}', rows='No change in rows or columns')
+    elif fn == 'Table.SelectRows':
+        inv = _invert(g(a, 1))
+        out.update(before='All rows from the previous step', after=f'Only rows where: {_pretty(g(a, 1))}',
+                   rows='Fewer rows. ' + (f'Rows are dropped when: {inv}' if inv else 'Rows that fail the condition are dropped.'))
+    elif fn == 'Table.RemoveRowsWithErrors':
+        out.update(before='Rows, some containing errors', after='Only rows without errors', rows='Fewer rows (error rows dropped)')
+    elif fn == 'Table.Distinct':
+        k = f' on {_fmt(_cols(a[1]))}' if len(a) > 1 else ' across all columns'
+        out.update(before='Rows, possibly containing duplicates', after=f'One row per distinct combination{k}', rows='Fewer rows (duplicates dropped)')
+    elif fn == 'Table.Sort':
+        out.update(before='Rows in their previous order', after='Rows ordered as described', rows='Same rows (order is not kept by the model)')
+    elif fn in ('Table.FirstN', 'Table.LastN', 'Table.Range'):
+        out.update(before='All rows', after='Only the selected rows', rows='Fewer rows')
+    elif fn in ('Table.Skip', 'Table.RemoveFirstN', 'Table.RemoveLastN', 'Table.RemoveRows'):
+        out.update(before='All rows', after='Selected top/bottom rows removed', rows='Fewer rows')
+    elif fn == 'Table.AddColumn':
+        name = _unq(g(a, 1))
+        typ = _type_label(a[3]) if len(a) > 3 else 'type not set'
+        out.update(before=f'No column "{name}"', after=f'New column "{name}" ({typ}) = {_pretty(g(a, 2))}',
+                   rows='No change in rows', delta=1)
+        _add(st, name)
+        if len(a) > 3:
+            st['types'][name] = typ
+    elif fn == 'Table.AddIndexColumn':
+        name = _unq(g(a, 1, '"Index"'))
+        out.update(before=f'No column "{name}"', after=f'New numbering column "{name}" (0/1, 2, 3 … per row)', rows='No change in rows', delta=1)
+        _add(st, name)
+    elif fn == 'Table.DuplicateColumn':
+        out.update(before=f'Only "{_unq(g(a, 1))}"', after=f'"{_unq(g(a, 1))}" plus an identical copy "{_unq(g(a, 2))}"', rows='No change in rows', delta=1)
+        _add(st, _unq(g(a, 2)))
+    elif fn == 'Table.SplitColumn':
+        src = _unq(g(a, 1)); new = _cols(a[3]) if len(a) > 3 else []
+        out.update(before=f'One column "{src}" holding combined text',
+                   after=(f'"{src}" is replaced by: {_fmt(new)}' if new else f'"{src}" is replaced by auto-named parts ({src}.1, {src}.2 …)'),
+                   rows='No change in rows', delta=(len(new) - 1) if new else None)
+        _drop(st, [src]); _add(st, *new)
+        if not new:
+            st['complete'] = False
+    elif fn == 'Table.CombineColumns':
+        srcs, new = _cols(g(a, 1)), _unq(g(a, 3))
+        out.update(before=f'Separate columns: {_fmt(srcs)}', after=f'One column "{new}" (the originals are removed)',
+                   rows='No change in rows', delta=1 - len(srcs))
+        _drop(st, srcs); _add(st, new)
+    elif fn == 'Table.ReplaceValue':
+        o = 'empty (null) values' if g(a, 1).strip() == 'null' else _pretty(g(a, 1))
+        out.update(before=f'Cells in {_fmt(_cols(g(a, 4)) if len(a) > 4 else ["the selected columns"])} contain {o}',
+                   after=f'Those values are replaced by {_pretty(g(a, 2)) if g(a, 2).strip() != "null" else "empty (null)"}',
+                   rows='No change in rows or columns')
+    elif fn in ('Table.FillDown', 'Table.FillUp'):
+        out.update(before=f'Empty cells in {_fmt(_cols(g(a, 1)))}', after='Empty cells are filled with the nearest non-empty value', rows='No change in rows or columns')
+    elif fn == 'Table.TransformColumns':
+        out.update(before='Original cell values', after='Values transformed in place (see description)', rows='No change in rows or columns')
+    elif fn == 'Table.TransformColumnNames':
+        _reset(st)
+        out.update(before='Original column names', after='All column names changed by a rule', rows='No change in rows', delta=0)
+    elif fn in ('Table.NestedJoin', 'Table.FuzzyNestedJoin'):
+        new, q, kind = _unq(g(a, 4)), _tname(g(a, 2)), g(a, 5)
+        km = re.search(r'JoinKind\.(\w+)', kind or '')
+        k = km.group(1) if km else 'LeftOuter'
+        rows = {'Inner': 'Only rows with a match are kept (unmatched rows disappear)',
+                'LeftOuter': 'Same rows (unmatched rows stay, with empty values)',
+                'LeftAnti': 'Only rows that have NO match are kept',
+                'RightOuter': 'All rows of the other table plus matches',
+                'FullOuter': 'All rows from both tables', 'RightAnti': 'Only rows of the other table that have no match'}.get(k, 'Depends on join kind')
+        out.update(before=f'Table without any data from "{q}"', after=f'New column "{new}" holds the matching rows of "{q}" (nested table, expanded next)',
+                   rows=rows, delta=1)
+        _add(st, new); st['types'][new] = 'Table (nested)'
+    elif fn == 'Table.Join':
+        _reset(st)
+        out.update(before=f'Table without data from "{_tname(g(a, 2))}"', after='Columns of both tables side by side',
+                   rows='Depends on the join kind', delta=None)
+    elif fn in ('Table.ExpandTableColumn', 'Table.ExpandRecordColumn'):
+        nested = _unq(g(a, 1)); sub = _cols(g(a, 2)); new = _cols(a[3]) if len(a) > 3 else sub
+        _drop(st, [nested]); _add(st, *new)
+        out.update(before=f'One nested column "{nested}"', after=f'Replaced by real columns: {_fmt(new)}',
+                   rows='Can increase: one source row repeats for every matching row in the other table' if fn == 'Table.ExpandTableColumn' else 'No change in rows',
+                   delta=len(new) - 1)
+    elif fn == 'Table.ExpandListColumn':
+        out.update(before='Each cell holds a list', after='One row per list item (other values repeat)', rows='MORE rows')
+    elif fn == 'Table.Combine':
+        out.update(before='Separate tables', after='One table: rows of all listed queries stacked', rows='MORE rows (sum of all appended tables)', delta=None)
+    elif fn == 'Table.Group':
+        keys = _cols(g(a, 1)); aggs = []
+        for it in _items(g(a, 2)):
+            p = _split(_inner(it))
+            if p:
+                aggs.append(_unq(p[0]))
+                if len(p) > 2:
+                    st['types'][_unq(p[0])] = _type_label(p[2])
+        out.update(before='Detail rows (one row per record)' + (f' with {cb} columns' if cb is not None else ''),
+                   after=(f'One row per {_fmt(keys)}' if keys else 'A single summary row') + f' with columns: {_fmt(keys + aggs, 12)}',
+                   rows='MUCH fewer rows: detail rows are summarised (granularity changes!)',
+                   delta=(len(keys) + len(aggs) - cb) if cb is not None else None)
+        st['cols'], st['complete'] = keys + aggs, True
+        st['types'] = {k: v for k, v in st['types'].items() if k in st['cols']}
+    elif fn == 'Table.UnpivotOtherColumns':
+        keys, attr, val = _cols(g(a, 1)), _unq(g(a, 2)), _unq(g(a, 3))
+        out.update(before=f'Wide table: besides {_fmt(keys)}, every other column holds its own values',
+                   after=f'Long table: {_fmt(keys)}, "{attr}" (old column name), "{val}" (cell value)',
+                   rows='MORE rows: rows × number of unpivoted columns',
+                   delta=(len(keys) + 2 - cb) if cb is not None else None)
+        st['cols'], st['complete'], st['types'] = keys + [attr, val], True, {}
+    elif fn == 'Table.Unpivot':
+        cols, attr, val = _cols(g(a, 1)), _unq(g(a, 2)), _unq(g(a, 3))
+        out.update(before=f'Separate columns: {_fmt(cols)}', after=f'Collapsed into "{attr}" (old column name) and "{val}" (cell value)',
+                   rows='MORE rows: rows × number of unpivoted columns', delta=2 - len(cols))
+        _drop(st, cols); _add(st, attr, val)
+    elif fn == 'Table.Pivot':
+        out.update(before=f'Values of "{_unq(g(a, 2))}" listed down the rows', after=f'Each distinct value becomes its own column holding {_unq(g(a, 3))}',
+                   rows='Fewer rows, MORE columns', delta=None)
+        _reset(st)
+    elif fn == 'Table.Transpose':
+        _reset(st)
+        out.update(before='Rows and columns as loaded', after='Rows and columns swapped', rows='Rows ⇄ columns swapped', delta=None)
+    elif fn == 'Table.Buffer':
+        out.update(before='Table read lazily', after='Table held fully in memory', rows='No change')
+    elif fn == 'Table.ReplaceErrorValues':
+        out.update(before='Cells with errors', after='Errors replaced by a fixed value', rows='No change in rows or columns')
+    elif fn == 'Table.FromList':
+        _reset(st)
+        out.update(before='A list of values/records', after='A table (usually one column that is expanded next)', rows='One row per list item', delta=None)
+    elif fn in ('Table.FromRows', 'Table.FromColumns', 'Table.FromRecords') or op == 'Manual data':
+        _reset(st)
+        out.update(before='—', after='Table created from hard-coded values', rows='Fixed number of typed-in rows', delta=None)
+    elif op == 'No change':
+        out.update(before='Previous result', after='Same result', rows='No change')
+    elif op == 'Reference another query':
+        _reset(st)
+        out.update(before='Current table', after='Rows of the referenced query', rows='Depends on that query', delta=None)
+    else:
+        _reset(st)
+        out.update(before='Result of the previous step', after='Result of this step (effect on columns/rows cannot be traced automatically)',
+                   rows='Not traceable', delta=None)
+    return out
+
+
+def _cols_phrase(cb, ca, delta):
+    if cb is not None and ca is not None:
+        return f'{ca} columns (count unchanged)' if cb == ca else f'{cb} → {ca} columns'
+    if ca is not None:
+        return f'becomes {ca} columns'
+    if delta is None:
+        return 'not traceable'
+    if delta == 0:
+        return 'same columns'
+    return f'{delta:+d} column(s)'
+
+
 # ======================================================== explain a query / whole model
 def explain_query(table, code):
     parsed = _parse_let(code)
@@ -691,10 +966,16 @@ def explain_query(table, code):
     rows, seen = [], set()
     src = dict(stype='Unknown', detail='', is_db=False, sql=None)
     src_found, obj = False, None
+    st = _new_state()
     for i, (name, expr) in enumerate(steps, 1):
         d = _describe(expr, seen)
+        fn, args = _call(expr.strip())
+        cb = len(st['cols']) if st['complete'] else None
+        eff = _effect(d, fn, args, st)
+        ca = len(st['cols']) if st['complete'] else None
         if d.get('source') and not src_found:
             src, src_found = d['source'], True
+            st['default'] = 'as delivered by the source' if src['is_db'] else 'Any (not typed yet)'
         if d.get('nav') and obj is None:
             obj = d['nav']
         if d.get('source_sql') and not src['sql']:
@@ -702,7 +983,10 @@ def explain_query(table, code):
         where, why = GUIDE.get(d['op'], (REV, 'Not specifically recognised, review manually.'))
         rows.append({'Table': table, '#': i, 'Step name': name, 'Operation': d['op'], 'Category': d['cat'],
                      'What it does (plain English)': d['desc'], 'Gold layer: where it belongs': where,
-                     'Why / what to do': why, 'Query folding': FOLD.get(d['op'], ''), 'M code': expr})
+                     'Why / what to do': why, 'Query folding': FOLD.get(d['op'], ''),
+                     'Before this step': eff['before'], 'After this step': eff['after'], 'Rows impact': eff['rows'],
+                     'Columns': _cols_phrase(cb, ca, eff['delta']),
+                     'Columns known after step': ', '.join(st['cols']) if st['complete'] else '', 'M code': expr})
         seen.add(name)
 
     if not src['is_db']:
@@ -751,7 +1035,8 @@ def explain_all(power_query_df):
             df = pd.DataFrame([{'Table': t, '#': 1, 'Step name': 'n/a', 'Operation': 'Could not parse',
                                 'Category': C_OTH, 'What it does (plain English)': f'Parser could not read this query ({ex}).',
                                 'Gold layer: where it belongs': REV, 'Why / what to do': 'Review the raw M code.',
-                                'Query folding': '', 'M code': code}])
+                                'Query folding': '', 'Before this step': '', 'After this step': '', 'Rows impact': '',
+                                'Columns': '', 'Columns known after step': '', 'M code': code}])
             srow = {'Table': t, 'Source type': 'Unknown', 'Source detail': '', 'Object': '', 'Custom SQL': ''}
             text = 'Parser could not read this query. Check the raw M code.'
         all_steps.append(df); sources.append(srow); summaries.append({'Table': t, 'Summary': text})
