@@ -16,7 +16,7 @@ def _table(df, cols, n=260):
     return '\n'.join(out) + '\n'
 
 
-def build_sections(steps, sources, summaries, dax):
+def build_sections(steps, sources, summaries, dax, gold=None):
     """Return [(title, markdown)] mirroring the Word document."""
     sec = []
     if steps is not None and len(steps):
@@ -32,6 +32,8 @@ def build_sections(steps, sources, summaries, dax):
             for _, r in s.iterrows():
                 md.append(f'**Step {r["#"]} · {r["Step name"]} · {r["Operation"]}**\n')
                 md.append(f'- **What it does:** {r["What it does (plain English)"]}')
+                md.append(f'- **Why it was done:** {r["Why it was done (likely reason)"]}')
+                md.append(f'\n```\n{r["M code"].strip()}\n```\n')
                 if r['Category'] != 'Source & connection':
                     md.append(f'- **Before:** {r["Before this step"]}')
                     md.append(f'- **After:** {r["After this step"]}')
@@ -52,7 +54,9 @@ def build_sections(steps, sources, summaries, dax):
                 md.append(f'```\n{r["DAX formula"]}\n```')
                 md.append(f'- **In plain English:** {r["What it calculates (plain English)"].replace(chr(10), "  \n  ")}')
                 md.append(f'- **Pattern:** {r["Pattern"]} · **Complexity:** {r["Complexity"]}')
-                md.append(f'- **Uses columns:** {r["Uses columns"] or "—"}')
+                md.append(f'- **Why it is used:** {r["Why it is used (purpose)"]}')
+                md.append(f'- **Tables used:** directly {r["Uses tables"] or "— (other measures only)"}; including via other measures: {r["Tables used (incl. via other measures)"] or "—"}')
+                md.append(f'- **Columns by table:** {r["Columns by table"].replace(chr(10), " · ") or "—"}  ·  **Cross-table:** {r["Cross-table"]}')
                 md.append(f'- **Depends on:** {r["Depends on measures"] or "— (base measure)"}  ·  **Used by:** {r["Used by measures"] or "—"}')
                 md.append(f'- **Filter context:** {r["Filter-context changes"]}')
                 md.append('- **Findings:**')
@@ -80,4 +84,28 @@ def build_sections(steps, sources, summaries, dax):
             md.append(f'- **In plain English:** {r["What it creates (plain English)"]}')
             md.append(f'- **Gold layer:** {r["Gold layer: where it belongs"]}. {r["Why / what to do"]}\n')
         sec.append((f'Calculated tables ({len(ct)})', '\n'.join(md)))
+    if gold:
+        tp, mp, cp = gold['tables'], gold['measures'], gold['calc_columns']
+        keep = int(tp['In Fabric semantic model'].isin(['Keep', 'Review', 'Merge into parent']).sum())
+        sec.append((f'Fabric Gold blueprint · target model ({len(tp)} tables today → about {keep})',
+                    _table(tp, ['Table', 'Role', 'In Fabric semantic model', 'Gold object', 'Why'])))
+        if mp is not None and len(mp):
+            md = [_table(mp, ['Measure', 'Gold layer action', 'Simple DAX in Power BI', 'Effort']), '']
+            for _, r in mp[mp['Gold layer action'] != 'Keep as is'].iterrows():
+                md.append(f'#### {r["Measure"]} · {r["Gold layer action"]}')
+                md.append(f'- **Gold layer work:** {r["Gold layer work"]}')
+                md.append(f'- **Simple DAX after:** `{r["Simple DAX in Power BI"]}`')
+                if r['Gold code (PySpark)']:
+                    md.append(f'\n```python\n{r["Gold code (PySpark)"]}\n```\n')
+                if r['Risk / check']:
+                    md.append(f'- **Check:** {r["Risk / check"]}')
+            sec.append(('Fabric Gold blueprint · measures', '\n'.join(md)))
+        if cp is not None and len(cp):
+            md = []
+            for _, r in cp.iterrows():
+                md.append(f'#### {r["Table"]}[{r["Column"]}] · {r["Status"]}')
+                md.append(f'```python\n{r["Gold code (PySpark)"]}\n```')
+            sec.append(('Fabric Gold blueprint · calculated columns', '\n'.join(md)))
+        for t, code in gold['code'].items():
+            sec.append((f'Fabric Gold blueprint · PySpark · {t}', f'```python\n{code}\n```'))
     return sec

@@ -235,37 +235,21 @@ def _todo(doc, steps):
 
 def _step_block(doc, r):
     is_src = r['Category'] == 'Source & connection'
-    t = doc.add_table(rows=1, cols=2)
-    t.alignment = WD_TABLE_ALIGNMENT.CENTER
-    _borders(t); _cell_margins(t)
-    h = t.rows[0].cells[0].merge(t.rows[0].cells[1])
-    _write(h, f'Step {r["#"]}  ·  {r["Step name"]}  ·  {r["Operation"]}', bold=True, color='FFFFFF', size=9.5)
-    _shade(h, NAVY); _keep_next(h); _row_flags(t.rows[0])
-
-    items = [('What it does', r['What it does (plain English)'])]
-    if not is_src:
-        items += [('Before', r['Before this step']), ('After', r['After this step']),
-                  ('Rows impact', r['Rows impact']), ('Columns', r['Columns'])]
-        if r['Columns known after step']:
-            items.append(('Columns now', r['Columns known after step']))
-    else:
-        items.append(('Result', r['After this step']))
     gold = r['Gold layer: where it belongs']
-    items.append(('Gold layer', f'{gold}.  {r["Why / what to do"]}'))
+    items = [('What it does', r['What it does (plain English)'], {}),
+             ('Why it was done', r['Why it was done (likely reason)'] or '—', {}),
+             ('M code (this step)', r['M code'].strip(), {'mono': True, 'fill': 'F2F2F2'})]
+    if not is_src:
+        items += [('Before', r['Before this step'], {}), ('After', r['After this step'], {'fill': 'F3FAF0'}),
+                  ('Rows impact', r['Rows impact'], {}), ('Columns', r['Columns'], {})]
+        if r['Columns known after step']:
+            items.append(('Columns now', r['Columns known after step'], {}))
+    else:
+        items.append(('Result', r['After this step'], {'fill': 'F3FAF0'}))
+    items.append(('Gold layer', f'{gold}.  {r["Why / what to do"]}', {'fill': FILL.get(gold, 'FFFFFF')}))
     if r['Query folding']:
-        items.append(('Query folding', r['Query folding'] + ': later steps may run inside Power BI instead of the source database.'))
-    for label, val in items:
-        cells = t.add_row().cells
-        _write(cells[0], label, bold=True, size=8.5, color=NAVY); _shade(cells[0], 'EAF0F8')
-        _write(cells[1], val, size=9)
-        if label == 'Gold layer':
-            _shade(cells[1], FILL.get(gold, 'FFFFFF'))
-        if label == 'After':
-            _shade(cells[1], 'F3FAF0')
-        _row_flags(t.rows[-1])
-        _keep_next(cells[0]); _keep_next(cells[1])
-    _fix_widths(t, [1.15, PAGE_W - 1.15])
-    _para(doc, '', after=4)
+        items.append(('Query folding', r['Query folding'] + ': later steps may run inside Power BI instead of the source database.', {}))
+    _kv_block(doc, f'Step {r["#"]}  ·  {r["Step name"]}  ·  {r["Operation"]}', items)
 
 
 def _table_section(doc, idx, table, steps, summary, final_schema):
@@ -384,10 +368,14 @@ def _dax_section(doc, idx, dax):
     doc.add_heading('Measure details', level=2)
     for _, r in ms.iterrows():
         fl = '\n'.join(f'[{sv}] {m}' for sv, m in r['_flags'])
+        tabs_txt = (f"Directly: {r['Uses tables'] or '— (other measures only)'}\nIncluding via other measures: {r['Tables used (incl. via other measures)'] or '—'}")
         items = [('DAX formula', r['DAX formula'], {'mono': True, 'fill': 'F2F2F2'}),
                  ('In plain English', r['What it calculates (plain English)'], {}),
+                 ('Why it is used', r['Why it is used (purpose)'], {'fill': 'FFFBEA'}),
+                 ('Tables used', tabs_txt, {}),
+                 ('Columns by table', r['Columns by table'] or '—', {}),
+                 ('Cross-table?', r['Cross-table'], {}),
                  ('Pattern', f"{r['Pattern']}  ·  Complexity: {r['Complexity']}", {}),
-                 ('Uses columns', r['Uses columns'] or '—', {}),
                  ('Depends on', r['Depends on measures'] or '— (base measure)', {}),
                  ('Used by', r['Used by measures'] or '— (not used by other measures)', {}),
                  ('Filter context', r['Filter-context changes'], {}),
@@ -430,8 +418,84 @@ def _calc_sections(doc, idx, dax):
     return idx
 
 
+
+# ------------------------------------------------------------------ Fabric Gold blueprint
+def _code_block(doc, text, size=7.5):
+    for line in str(text).splitlines() or ['']:
+        p = doc.add_paragraph()
+        p.paragraph_format.space_after = Pt(0); p.paragraph_format.space_before = Pt(0)
+        r = p.add_run(line.replace('\\t', '    ') or ' ')
+        r.font.name, r.font.size = 'Consolas', Pt(size)
+        _shade_par(p)
+
+
+def _gold_section(doc, idx, gold):
+    if not gold:
+        return idx
+    tp, mp, cp = gold['tables'], gold['measures'], gold['calc_columns']
+    doc.add_page_break()
+    doc.add_heading(f'{idx}. Fabric Gold layer blueprint', level=1)
+    _para(doc, ('Target design: ALL data transformations and row-level business logic live in the Fabric Gold layer (Lakehouse/Warehouse). '
+                'The Power BI semantic model then contains only a small star schema and simple DAX.'), after=4)
+    for txt in ('Power Query steps become Gold-layer code (draft PySpark is generated below).',
+                'Calculated columns and row-by-row DAX become real columns in the Gold tables.',
+                'Only simple measures stay in DAX: aggregations, ratios, standard time intelligence and "ignore filter" patterns that depend on user selections.',
+                'Helper, lookup and unused tables are removed from the model: fewer tables, smaller model, faster refresh.'):
+        p = doc.add_paragraph(style='List Bullet'); r = p.add_run(txt); r.font.size = Pt(9.5)
+
+    doc.add_heading('Target model: which tables stay', level=2)
+    keep = int(tp['In Fabric semantic model'].isin(['Keep', 'Review', 'Merge into parent']).sum())
+    _para(doc, f'{len(tp)} table(s) in the model today → about {keep} after the Gold layer (Keep/Review). '
+               f'{len(tp) - keep} table(s) are removed or merged.', after=4).paragraph_format.keep_with_next = True
+    fill = {'Keep': 'E2EFDA', 'Review': 'FFF2CC', 'Remove from model': 'F8CBAD', 'Candidate to remove': 'F8CBAD', 'Merge into parent': 'FCE4D6'}
+    rows = [[r['Table'], r['Role'], r['In Fabric semantic model'], r['Gold object'], r['Why']] for _, r in tp.iterrows()]
+    _grid(doc, [1.05, 1.1, 1.0, 1.2, 2.55], ['Table', 'Role', 'In model?', 'Gold object', 'Why'], rows, size=8,
+          fills={(i, 2): fill.get(r['In Fabric semantic model']) for i, (_, r) in enumerate(tp.iterrows())}, zebra=False)
+
+    if mp is not None and len(mp):
+        doc.add_heading('Measures: what stays in Power BI and what moves to Gold', level=2)
+        stay = int(mp['Gold layer action'].str.startswith(('Keep', 'Simplify')).sum())
+        _para(doc, f'{stay} of {len(mp)} measure(s) stay as simple DAX; {len(mp) - stay} need Gold-layer work.', after=4).paragraph_format.keep_with_next = True
+        afill = {'Keep': 'E2EFDA', 'Move': 'FCE4D6', 'Simplify': 'FFF2CC', 'Redesign': 'F8CBAD', 'Review': 'F8CBAD'}
+        rows = [[r['Measure'], r['Gold layer action'], r['Simple DAX in Power BI'], r['Effort']] for _, r in mp.iterrows()]
+        _grid(doc, [1.35, 1.65, 3.2, 0.7], ['Measure', 'Gold layer action', 'Simple DAX left in Power BI', 'Effort'], rows, size=8,
+              fills={(i, 1): afill.get(r['Gold layer action'].split(' ')[0]) for i, (_, r) in enumerate(mp.iterrows())}, zebra=False)
+        mv = mp[mp['Gold layer action'] != 'Keep as is']
+        if len(mv):
+            doc.add_heading('Gold-layer work per measure', level=3)
+            for _, r in mv.iterrows():
+                items = [('Current DAX', gold['formulas'].get(r['Measure'], ''), {'mono': True, 'fill': 'F2F2F2'}),
+                         ('Gold layer work', r['Gold layer work'], {}),
+                         ('Simple DAX after', r['Simple DAX in Power BI'], {'mono': True, 'fill': 'E2EFDA'})]
+                if r['Gold code (PySpark)']:
+                    items.append(('Gold code (PySpark)', r['Gold code (PySpark)'], {'mono': True, 'fill': 'F2F2F2'}))
+                if r['Risk / check']:
+                    items.append(('Check', r['Risk / check'], {'fill': 'FFF2CC'}))
+                _kv_block(doc, f"{r['Measure']}  ·  {r['Gold layer action']}  ·  effort: {r['Effort']}", items)
+
+    if cp is not None and len(cp):
+        doc.add_heading('Calculated columns → Gold columns', level=2)
+        for _, r in cp.iterrows():
+            _kv_block(doc, f"{r['Table']}[{r['Column']}]  ·  {r['Status']}",
+                      [('Current DAX', r['DAX formula'], {'mono': True, 'fill': 'F2F2F2'}),
+                       ('Gold code (PySpark)', r['Gold code (PySpark)'], {'mono': True, 'fill': 'F2F2F2'}),
+                       ('Joins needed', r['Joins needed'], {})])
+
+    doc.add_heading('Draft PySpark per table (Fabric notebook)', level=2)
+    _para(doc, 'Generated from the Power Query steps. Review before running: replace Bronze table names with your own and compare row counts with the original report.', size=9, italic=True, color=GREY, after=4)
+    st = gold.get('stats')
+    if st is not None and len(st):
+        _grid(doc, [2.5, 2.2, 2.2], ['Table', 'Steps translated automatically', 'Steps needing manual work'],
+              [[r['Table'], r['Steps translated automatically'], r['Steps needing manual work']] for _, r in st.iterrows()], size=8.5)
+        _para(doc, '', after=2)
+    for t, code in gold['code'].items():
+        doc.add_heading(t, level=3)
+        _code_block(doc, code)
+    return idx + 1
+
+
 # ------------------------------------------------------------------ public API
-def build_docx(file_name, steps, sources, summaries, power_query, final_schema=None, include_m_code=True, dax=None) -> bytes:
+def build_docx(file_name, steps, sources, summaries, power_query, final_schema=None, include_m_code=True, dax=None, gold=None) -> bytes:
     doc = Document()
     for z in doc.settings.element.findall(qn('w:zoom')):
         z.set(qn('w:percent'), '100')
@@ -457,6 +521,7 @@ def build_docx(file_name, steps, sources, summaries, power_query, final_schema=N
     nxt = 4 + len(tables)
     nxt = _dax_section(doc, nxt, dax)
     nxt = _calc_sections(doc, nxt, dax)
+    nxt = _gold_section(doc, nxt, gold)
     if has_pq and include_m_code:
         _appendix(doc, power_query, tables)
     _notes(doc)

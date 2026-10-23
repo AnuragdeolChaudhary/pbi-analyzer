@@ -959,6 +959,141 @@ def _cols_phrase(cb, ca, delta):
     return f'{delta:+d} column(s)'
 
 
+
+# ======================================================== why was this step done (inferred purpose)
+_TECH = re.compile(r'guid|rowversion|modified|created|updated|etl|batch|audit|checksum|hash|row_?id', re.I)
+
+
+def _filter_reason(cond):
+    pt = _pretty(cond, 500)
+    rs = []
+    for p in re.split(r' AND | OR ', pt):
+        p = p.strip()
+        m = re.fullmatch(r'(.+?)\s*(≠|>=|<=|=|>|<)\s*(.+)', p)
+        if m:
+            col, op, val = m.groups()
+            if val == 'empty':
+                rs.append(f'drops rows where {col} is empty (incomplete records)' if op == '≠' else f'keeps only rows where {col} is empty')
+            elif op == '≠':
+                rs.append(f'excludes rows where {col} is {val}')
+            elif op == '=':
+                rs.append(f'keeps only rows where {col} is {val}')
+            elif op in ('>', '>=') and val in ('0', '0.0'):
+                rs.append(f'removes zero or negative values of {col}')
+            elif re.search(r'date|year|month|day', col, re.I):
+                rs.append(f'limits {col} to the period that matters for reporting')
+            else:
+                rs.append(f'keeps rows where {col} {op} {val}')
+        elif ' contains ' in p or ' starts with ' in p or ' ends with ' in p or ' is one of ' in p:
+            rs.append(f'keeps rows where {p}')
+        else:
+            rs.append(f'keeps rows where {p}')
+    return ('Restricts the data to the rows that are relevant: ' + '; '.join(rs) +
+            '. Rows that fail are removed before loading, so they cannot inflate or distort totals.')
+
+
+def _why(d, fn, a, st):
+    op = d['op']
+    if op == 'Connect to source':
+        return 'Defines where the data comes from. Every later step works on this data.'
+    if op == 'Custom SQL query':
+        return ('Hand-written SQL pushes joins/filters to the database before loading, usually to reduce rows or reuse an existing '
+                'report query. In a Gold-layer design this logic becomes a Gold table or view.')
+    if op == 'Navigate to object':
+        return 'Selects the one table / sheet needed out of everything the source offers.'
+    if fn == 'Table.PromoteHeaders':
+        return 'Excel/CSV files deliver the header as an ordinary row. Promoting it gives columns usable names.'
+    if fn == 'Table.TransformColumnTypes':
+        types = {}
+        for it in _items(g(a, 1)):
+            p = _split(_inner(it))
+            if len(p) >= 2:
+                types.setdefault(_type_label(p[1]), []).append(_unq(p[0]))
+        bits = []
+        for t, c in types.items():
+            if t.startswith('Date'):
+                bits.append(f'{_fmt(c, 4)} → {t}: needed for time intelligence and for relationships to a date table')
+            elif t in ('Decimal number', 'Whole number', 'Fixed decimal (currency)', 'Percentage'):
+                bits.append(f'{_fmt(c, 4)} → {t}: so values can be summed, averaged and sorted as numbers')
+            elif t == 'Text':
+                bits.append(f'{_fmt(c, 4)} → Text: keeps codes/keys intact (no accidental number formatting)')
+            else:
+                bits.append(f'{_fmt(c, 4)} → {t}')
+        return 'Power BI needs correct data types. ' + '; '.join(bits) + '.'
+    if fn == 'Table.RenameColumns':
+        return 'Gives business-friendly names to what report users see, and avoids clashes between columns of different tables.'
+    if fn == 'Table.RemoveColumns':
+        cols = _cols(g(a, 1)); tech = [c for c in cols if _TECH.search(c)]
+        extra = f' Includes technical/audit columns ({_fmt(tech, 4)}).' if tech else ''
+        return 'Drops columns nobody needs in reports. Every extra column costs memory and refresh time.' + extra
+    if fn == 'Table.SelectColumns':
+        return 'Keeps only the needed columns and drops everything else, which keeps the model small.'
+    if fn == 'Table.ReorderColumns':
+        return 'Cosmetic: tidier column order when browsing the table in Power Query.'
+    if fn == 'Table.SelectRows':
+        return _filter_reason(g(a, 1))
+    if fn == 'Table.RemoveRowsWithErrors':
+        return 'Prevents refresh failures and wrong totals caused by cells that contain errors.'
+    if fn == 'Table.Distinct':
+        return 'Guarantees uniqueness (for example a key that must be unique to sit on the "one" side of a relationship).'
+    if fn == 'Table.Sort':
+        return 'Usually done to eyeball the data. Power BI does not keep this order, so it normally has no lasting effect.'
+    if fn in ('Table.FirstN', 'Table.LastN', 'Table.Range'):
+        return 'Limits how many rows are loaded. Check it is intentional and not a leftover "top 100" test limit.'
+    if fn in ('Table.Skip', 'Table.RemoveFirstN', 'Table.RemoveLastN', 'Table.RemoveRows'):
+        return 'Strips junk rows such as report titles, notes or totals above/below the real data.'
+    if fn == 'Table.AddColumn':
+        h = _expr_hint(g(a, 2))
+        why = ('a business rule / category' if 'conditional IF/ELSE logic' in h else
+               'a calculated amount' if 'arithmetic' in h else 'a label or key built from text' if 'text manipulation' in h else
+               'a date-based value' if 'date calculation' in h else 'a value that does not exist in the source')
+        return f'Creates {why} ("{_unq(g(a, 1))}") so reports do not need to recompute it. This row-level logic belongs in the Gold layer.'
+    if fn == 'Table.AddIndexColumn':
+        return 'Creates a unique row number / surrogate key, for example to identify rows or keep an original order.'
+    if fn == 'Table.DuplicateColumn':
+        return 'Keeps an untouched copy of a column before it is transformed further (for example split or replaced).'
+    if fn == 'Table.SplitColumn':
+        return 'Separates combined information into individual columns so users can filter and group by each part.'
+    if fn == 'Table.CombineColumns':
+        return 'Builds a single display field or composite key from several columns.'
+    if fn == 'Table.ReplaceValue':
+        return 'Cleans a known data-quality issue (for example empty values → 0) so calculations do not break or show blanks.'
+    if fn in ('Table.FillDown', 'Table.FillUp'):
+        return 'Excel-style exports leave blanks under grouped/merged cells. Filling them gives every row its own value.'
+    if fn == 'Table.TransformColumns':
+        return 'Standardises values (trim spaces, fix case) so equal values really match in relationships and slicers.'
+    if fn in ('Table.NestedJoin', 'Table.FuzzyNestedJoin', 'Table.Join'):
+        return (f'Brings attributes from "{_tname(g(a, 2))}" onto this table so users can filter and group by them without a separate '
+                'relationship (denormalising). In a star schema this is normally done upstream or replaced by a relationship.')
+    if fn in ('Table.ExpandTableColumn', 'Table.ExpandRecordColumn'):
+        return 'Chooses which columns of the merged table are kept; the rest are discarded.'
+    if fn == 'Table.Combine':
+        return 'Combines several tables with the same structure (for example one per year/region) into a single table.'
+    if fn == 'Table.Group':
+        keys = _cols(g(a, 1))
+        return (f'Summarises detail rows to a coarser level ({_fmt(keys)}). The model becomes smaller and faster, '
+                'but detail below that level can no longer be analysed.')
+    if fn in ('Table.Unpivot', 'Table.UnpivotOtherColumns'):
+        return 'Turns a wide layout (one column per month/category) into a tall one, which is what charts and slicers on that field require.'
+    if fn == 'Table.Pivot':
+        return 'Spreads values into separate columns (a matrix layout), usually to match a source report layout.'
+    if fn == 'Table.Transpose':
+        return 'Flips rows and columns, usually because the source sheet is laid out sideways.'
+    if fn == 'Table.Buffer':
+        return 'Performance tweak: holds the table in memory so later steps do not re-read the source.'
+    if fn == 'Table.ReplaceErrorValues':
+        return 'Stops errors from breaking the refresh by substituting a fixed value.'
+    if fn == 'Table.FromList':
+        return 'Turns an API/JSON result into a table so its fields can be expanded into columns.'
+    if op == 'Manual data':
+        return 'Hard-coded lookup data typed into the query (mapping, categories). It should live in a proper table in the lakehouse/warehouse.'
+    if op == 'No change':
+        return 'Housekeeping step that simply re-uses an earlier result.'
+    if op == 'Reference another query':
+        return 'Re-uses another query as its starting point (staging pattern) to avoid loading the same source twice.'
+    return 'Purpose cannot be inferred automatically for this step: confirm with the report author.'
+
+
 # ======================================================== explain a query / whole model
 def explain_query(table, code):
     parsed = _parse_let(code)
@@ -971,6 +1106,7 @@ def explain_query(table, code):
         d = _describe(expr, seen)
         fn, args = _call(expr.strip())
         cb = len(st['cols']) if st['complete'] else None
+        purpose_txt = _why(d, fn, args, st)
         eff = _effect(d, fn, args, st)
         ca = len(st['cols']) if st['complete'] else None
         if d.get('source') and not src_found:
@@ -984,7 +1120,7 @@ def explain_query(table, code):
         rows.append({'Table': table, '#': i, 'Step name': name, 'Operation': d['op'], 'Category': d['cat'],
                      'What it does (plain English)': d['desc'], 'Gold layer: where it belongs': where,
                      'Why / what to do': why, 'Query folding': FOLD.get(d['op'], ''),
-                     'Before this step': eff['before'], 'After this step': eff['after'], 'Rows impact': eff['rows'],
+                     'Why it was done (likely reason)': purpose_txt, 'Before this step': eff['before'], 'After this step': eff['after'], 'Rows impact': eff['rows'],
                      'Columns': _cols_phrase(cb, ca, eff['delta']),
                      'Columns known after step': ', '.join(st['cols']) if st['complete'] else '', 'M code': expr})
         seen.add(name)
@@ -1035,7 +1171,7 @@ def explain_all(power_query_df):
             df = pd.DataFrame([{'Table': t, '#': 1, 'Step name': 'n/a', 'Operation': 'Could not parse',
                                 'Category': C_OTH, 'What it does (plain English)': f'Parser could not read this query ({ex}).',
                                 'Gold layer: where it belongs': REV, 'Why / what to do': 'Review the raw M code.',
-                                'Query folding': '', 'Before this step': '', 'After this step': '', 'Rows impact': '',
+                                'Query folding': '', 'Why it was done (likely reason)': '', 'Before this step': '', 'After this step': '', 'Rows impact': '',
                                 'Columns': '', 'Columns known after step': '', 'M code': code}])
             srow = {'Table': t, 'Source type': 'Unknown', 'Source detail': '', 'Object': '', 'Custom SQL': ''}
             text = 'Parser could not read this query. Check the raw M code.'

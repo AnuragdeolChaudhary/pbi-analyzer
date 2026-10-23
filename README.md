@@ -19,3 +19,8 @@ Upload a `.pbix` / `.pbit` → plain-English explanation of every Power Query st
 - `m_explainer.py`: Power Query (M) → plain English, before/after tracing, Gold-layer advice
 - `dax_explainer.py`: DAX → plain English, dependencies, performance findings, Gold-layer advice
 - `doc_export.py`: formatted Word document (python-docx); `doc_preview.py`: same content shown in the app
+
+## Fabric Gold-layer blueprint
+`gold_blueprint.py` turns the model into a migration plan: which tables stay in the semantic model, draft PySpark per table
+(translated from the Power Query steps), Gold columns for calculated columns / iterator / filtered measures, and the simple DAX
+that remains in Power BI. Import the generated `.ipynb` into a Fabric notebook, review, and run. Lines marked `# TODO (manual)` need a person.

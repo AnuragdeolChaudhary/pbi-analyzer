@@ -599,6 +599,47 @@ def _filter_ctx(an):
     return '; '.join(hits) if hits else 'None: follows the filters of the visual and slicers'
 
 
+
+def _purpose(name, an, pattern, used_by):
+    cols = an['cols']; first = cols[0] if cols else 'its inputs'
+    deps = an['measures']
+    tbl = ', '.join(an['tables']) if an['tables'] else 'other measures only'
+    n = name
+    if pattern == 'Simple aggregation':
+        t = f'Base building block: adds up / counts {first} once, so every visual and every other measure uses the same definition of "{n}".'
+    elif pattern == 'Ratio / percentage':
+        lead = f'KPI: expresses {deps[0]} relative to {deps[1]}' if len(deps) >= 2 else 'KPI: a ratio, rate or percentage'
+        if 'DIVIDE' in an['funcs']:
+            t = lead + ', so reports can compare performance independent of size. DIVIDE avoids errors when the denominator is zero.'
+        else:
+            t = lead + '. Ratios must be calculated after totals are known, so they cannot be stored as a column.'
+    elif pattern == 'Time intelligence':
+        t = 'Compares or accumulates a value over time (year-to-date, same period last year, moving periods). Requires a continuous Date table.'
+    elif pattern == 'Filtered / context-changing calculation':
+        t = 'Answers a specific business question: the value for a defined subset of the data, or ignoring the filters users select.'
+    elif pattern == 'Row-by-row calculation (iterator)':
+        t = 'Needs a calculation on every row (for example quantity × price) before adding up, which a plain SUM cannot do.'
+    elif pattern == 'Conditional logic':
+        t = 'Applies a business rule: returns a label or value depending on a condition.'
+    elif pattern == 'Combination of other measures':
+        t = 'Combines existing measures into a new figure (for example difference or sum), re-using their definitions.'
+    elif pattern == 'Ranking / Top N':
+        t = 'Ranks or limits items (for example top customers).'
+    elif pattern == 'Selection / parameter':
+        t = 'Reads what the user selected (slicer / what-if) and feeds it into other calculations.'
+    elif pattern == 'Text / formatting':
+        t = 'Builds text for titles, labels or tooltips.'
+    elif deps and cols:
+        t = (f'Combines {", ".join(deps)} with values read directly from {", ".join(cols)}, typically to compare actual against '
+             'another source (variance / difference).')
+    else:
+        t = 'Custom calculation combining several functions.'
+    t += f' Reads from: {tbl}.'
+    t += (f' Re-used by {len(used_by)} other measure(s): changing it changes them too.' if used_by
+          else ' It is a final measure shown directly in reports (no other measure depends on it).')
+    return t
+
+
 # ====================================================================== public API
 def explain_measures(measures_df, columns_stats=None):
     """Return (measures_explained_df, dependencies_df)."""
@@ -640,6 +681,30 @@ def explain_measures(measures_df, columns_stats=None):
         return 1 + max(level(d, seen + (n,)) for d in deps[n])
     df['Used by measures'] = df['Measure'].map(lambda n: ', '.join(sorted(used_by.get(n, []))))
     df['Dependency level'] = df['Measure'].map(level)
+    direct = {r['Measure']: [t for t in r['Uses tables'].split(', ') if t] for _, r in df.iterrows()}
+
+    def all_tables(n, seen=()):
+        if n in seen:
+            return []
+        out = list(direct.get(n, []))
+        for d in deps.get(n, []):
+            for t in all_tables(d, seen + (n,)):
+                if t not in out:
+                    out.append(t)
+        return out
+    df['Tables used (incl. via other measures)'] = df['Measure'].map(lambda n: ', '.join(all_tables(n)))
+
+    def by_table(cols_text):
+        g = {}
+        for c in [x for x in cols_text.split(', ') if x]:
+            g.setdefault(c.split('[', 1)[0], []).append(c.split('[', 1)[1].rstrip(']') if '[' in c else c)
+        return '\n'.join(f'{t}: {", ".join(cs)}' for t, cs in g.items())
+    df['Columns by table'] = df['Uses columns'].map(by_table)
+    df['Why it is used (purpose)'] = df.apply(lambda r: _purpose(r['Measure'], {'cols': [x for x in r['Uses columns'].split(', ') if x],
+        'measures': [x for x in r['Depends on measures'].split(', ') if x], 'tables': [x for x in r['Uses tables'].split(', ') if x],
+        'funcs': Counter(re.findall(r'\b([A-Z]+)\s*\(', r['DAX formula'].upper()))}, r['Pattern'],
+        [x for x in r['Used by measures'].split(', ') if x]), axis=1)
+    df['Cross-table'] = df['Uses tables'].map(lambda t: 'Yes: needs a relationship between ' + t.replace(', ', ' and ') if len([x for x in t.split(', ') if x]) > 1 else 'No')
     dep_df = df[['Table', 'Measure', 'Dependency level', 'Depends on measures', 'Used by measures']].copy()
     dep_df['Role'] = dep_df.apply(lambda r: 'Base measure' if not r['Depends on measures'] else ('Final / top-level measure' if not r['Used by measures'] else 'Intermediate measure'), axis=1)
     return df, dep_df
